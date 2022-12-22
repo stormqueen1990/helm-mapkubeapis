@@ -16,14 +16,16 @@ limitations under the License.
 
 package mapping
 
+import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 // Mapping describes mappings which defines the Kubernetes
 // API deprecations and the new replacement API
 type Mapping struct {
 	// From is the API looking to be mapped
-	DeprecatedAPI string `json:"deprecatedAPI"`
+	DeprecatedAPI metav1.GroupVersionKind `json:"deprecatedAPI"`
 
 	// To is the API to be mapped to
-	NewAPI string `json:"newAPI"`
+	NewAPI metav1.GroupVersionKind `json:"newAPI"`
 
 	// Kubernetes version API is deprecated in
 	DeprecatedInVersion string `json:"deprecatedInVersion,omitempty"`

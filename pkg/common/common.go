@@ -17,8 +17,8 @@ limitations under the License.
 package common
 
 import (
+	"fmt"
 	"log"
-	"strings"
 
 	utils "github.com/maorfr/helm-plugin-utils/pkg"
 	"github.com/pkg/errors"
@@ -42,28 +42,36 @@ type MapOptions struct {
 	ReleaseNamespace string
 }
 
-// UpgradeDescription is description of why release was upgraded
-const UpgradeDescription = "Kubernetes deprecated API upgrade - DO NOT rollback from this version"
+const (
+	// UpgradeDescription is description of why release was upgraded
+	UpgradeDescription = "Kubernetes deprecated API upgrade - DO NOT rollback from this version"
+
+	// ApiVersionFieldName is the name of the field in the manifest that holds the API version and group information
+	ApiVersionFieldName = "apiVersion"
+
+	// KindFieldName is the name of the field in the manifest that holds the Kind information
+	KindFieldName = "kind"
+)
 
 // ReplaceManifestUnSupportedAPIs returns a release manifest with deprecated or removed
 // Kubernetes APIs updated to supported APIs
-func ReplaceManifestUnSupportedAPIs(origManifest, mapFile string, kubeConfig KubeConfig) (string, error) {
+func ReplaceManifestUnSupportedAPIs(origManifest []map[string]interface{}, mapFile string, kubeConfig KubeConfig) ([]map[string]interface{}, error) {
 	var modifiedManifest = origManifest
 	var err error
 	var mapMetadata *mapping.Metadata
 
 	// Load the mapping data
 	if mapMetadata, err = mapping.LoadMapfile(mapFile); err != nil {
-		return "", errors.Wrapf(err, "Failed to load mapping file: %s", mapFile)
+		return nil, errors.Wrapf(err, "Failed to load mapping file: %s", mapFile)
 	}
 
 	// get the Kubernetes server version
 	kubeVersionStr, err := getKubernetesServerVersion(kubeConfig)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if !semver.IsValid(kubeVersionStr) {
-		return "", errors.Errorf("Failed to get Kubernetes server version")
+		return nil, errors.Errorf("Failed to get Kubernetes server version")
 	}
 
 	// Check for deprecated or removed APIs and map accordingly to supported versions
@@ -77,18 +85,47 @@ func ReplaceManifestUnSupportedAPIs(origManifest, mapFile string, kubeConfig Kub
 			apiVersionStr = mapping.RemovedInVersion
 		}
 		if !semver.IsValid(apiVersionStr) {
-			return "", errors.Errorf("Failed to get the deprecated or removed Kubernetes version for API: %s", strings.ReplaceAll(deprecatedAPI, "\n", " "))
+			return nil, errors.Errorf("Failed to get the deprecated or removed Kubernetes version for API: %s", deprecatedAPI)
 		}
 
-		if count := strings.Count(modifiedManifest, deprecatedAPI); count > 0 {
-			if semver.Compare(apiVersionStr, kubeVersionStr) > 0 {
-				log.Printf("The following API does not require mapping as the "+
-					"API is not deprecated or removed in Kubernetes '%s':\n\"%s\"\n", apiVersionStr,
-					deprecatedAPI)
-			} else {
-				log.Printf("Found %d instances of deprecated or removed Kubernetes API:\n\"%s\"\nSupported API equivalent:\n\"%s\"\n", count, deprecatedAPI, supportedAPI)
-				modifiedManifest = strings.ReplaceAll(modifiedManifest, deprecatedAPI, supportedAPI)
+		if semver.Compare(apiVersionStr, kubeVersionStr) > 0 {
+			log.Printf("The following API does not require mapping as the "+
+				"API is not deprecated or removed in Kubernetes '%s':\n\"%s\"\n", apiVersionStr,
+				deprecatedAPI)
+			continue
+		}
+
+		apiVersion := fmt.Sprintf("%v/%v", deprecatedAPI.Group, deprecatedAPI.Version)
+
+		count := 0
+		var logFormat string
+		// If no superseding supported API is found, this means we should remove the manifest entirely
+		if supportedAPI.Kind == "" || supportedAPI.Group == "" {
+			logFormat = fmt.Sprintf("Found %%d instances of the removed Kubernetes API:\n\"%s\"\n", deprecatedAPI)
+
+			for index, manifest := range modifiedManifest {
+				if manifest[ApiVersionFieldName] == apiVersion && manifest[KindFieldName] == deprecatedAPI.Kind {
+					// Remove the current manifest from the release as it does not have a superseding API.
+					modifiedManifest = append(modifiedManifest[:index], modifiedManifest[index+1:]...)
+				}
 			}
+		} else {
+			logFormat = fmt.Sprintf("Found %%d instances of deprecated or removed Kubernetes API:\n\"%s\"\nSupported API equivalent:\n\"%s\"\n", deprecatedAPI, supportedAPI)
+
+			for _, manifest := range modifiedManifest {
+				apiVersion := fmt.Sprintf("%v/%v", deprecatedAPI.Group, deprecatedAPI.Version)
+
+				if manifest[ApiVersionFieldName] == apiVersion && manifest[KindFieldName] == deprecatedAPI.Kind {
+					newApiVersion := fmt.Sprintf("%v/%v", supportedAPI.Group, supportedAPI.Version)
+					manifest[ApiVersionFieldName] = newApiVersion
+					count++
+				}
+			}
+		}
+
+		// output the number of occurrences found + the kind of occurrence (removal or version upgrade)
+		if count > 0 {
+			log.Printf(logFormat, count)
 		}
 	}
 

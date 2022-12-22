@@ -17,15 +17,19 @@ limitations under the License.
 package v3
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"log"
+	"reflect"
 
 	"github.com/pkg/errors"
 
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/release"
 
-	common "github.com/helm/helm-mapkubeapis/pkg/common"
+	"github.com/helm/helm-mapkubeapis/pkg/common"
+	"gopkg.in/yaml.v3"
 )
 
 // MapReleaseWithUnSupportedAPIs checks the latest release version for any deprecated or removed APIs in its metadata
@@ -44,13 +48,17 @@ func MapReleaseWithUnSupportedAPIs(mapOptions common.MapOptions) error {
 	}
 
 	log.Printf("Check release '%s' for deprecated or removed APIs...\n", releaseName)
-	var origManifest = releaseToMap.Manifest
+	origManifest, err := decodeManifests(releaseToMap.Manifest)
+	if err != nil {
+		return errors.Wrapf(err, "failed to unmarshal manifests")
+	}
+
 	modifiedManifest, err := common.ReplaceManifestUnSupportedAPIs(origManifest, mapOptions.MapFile, mapOptions.KubeConfig)
 	if err != nil {
 		return err
 	}
 	log.Printf("Finished checking release '%s' for deprecated or removed APIs.\n", releaseName)
-	if modifiedManifest == origManifest {
+	if reflect.DeepEqual(modifiedManifest, origManifest) {
 		log.Printf("Release '%s' has no deprecated or removed APIs.\n", releaseName)
 		return nil
 	}
@@ -59,7 +67,13 @@ func MapReleaseWithUnSupportedAPIs(mapOptions common.MapOptions) error {
 		log.Printf("Deprecated or removed APIs exist, for release: %s.\n", releaseName)
 	} else {
 		log.Printf("Deprecated or removed APIs exist, updating release: %s.\n", releaseName)
-		if err := updateRelease(releaseToMap, modifiedManifest, cfg); err != nil {
+
+		newManifest, err := encodeManifests(modifiedManifest)
+		if err != nil {
+			return errors.Wrapf(err, "failed to encode manifests")
+		}
+
+		if err := updateRelease(releaseToMap, newManifest, cfg); err != nil {
 			return errors.Wrapf(err, "failed to update release '%s'", releaseName)
 		}
 		log.Printf("Release '%s' with deprecated or removed APIs updated successfully to new version.\n", releaseName)
@@ -99,4 +113,56 @@ func getLatestRelease(releaseName string, cfg *action.Configuration) (*release.R
 
 func getReleaseVersionName(rel *release.Release) string {
 	return fmt.Sprintf("%s.v%d", rel.Name, rel.Version)
+}
+
+// decodeManifests decodes the release secret into a list of manifests that can be edited
+func decodeManifests(releaseManifestData string) ([]map[string]interface{}, error) {
+	decoder := yaml.NewDecoder(bytes.NewReader([]byte(releaseManifestData)))
+
+	manifests := make([]map[string]interface{}, 0)
+	for {
+		var value map[string]interface{}
+		err := decoder.Decode(&value)
+
+		// we reached the end of the stream
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		// object is empty, no need to inspect it
+		if value == nil || len(value) == 0 {
+			continue
+		}
+
+		// another non-recoverable error happened, break processing here
+		if err != nil {
+			return nil, err
+		}
+
+		manifests = append(manifests, value)
+	}
+
+	return manifests, nil
+}
+
+// encodeManifests creates a new YAML representation of the edited manifests
+func encodeManifests(manifests []map[string]interface{}) (string, error) {
+	marshalledYaml := bytes.NewBuffer(make([]byte, 0, 1024*len(manifests))) // create a buffer with 1 KB capacity per manifest
+	encoder := yaml.NewEncoder(marshalledYaml)
+	encoder.SetIndent(2) // TODO make this parameterizable
+
+	for _, manifest := range manifests {
+		if err := encoder.Encode(manifest); err != nil {
+			return "", err
+		}
+	}
+
+	if err := encoder.Close(); err != nil {
+		return "", err
+	}
+
+	// the go-yaml encoder does not add the "---" header, but we need it for Helm
+	newYamlContent := fmt.Sprintf("---\n%s", marshalledYaml.Bytes())
+
+	return newYamlContent, nil
 }
